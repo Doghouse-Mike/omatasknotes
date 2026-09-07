@@ -424,13 +424,26 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                id: titleText
                 width: parent.width
                 text: "TaskNotes" + (root.currentView ? " · " + root.currentView.name : "")
-                color: root.foreground
+                  + (titleMouse.enabled ? "  ▾" : "")
+                color: titleMouse.containsMouse ? root.accent : root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.title
                 font.bold: true
                 elide: Text.ElideRight
+
+                MouseArea {
+                  id: titleMouse
+                  anchors.fill: parent
+                  enabled: !root.vaultUnconfigured
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.settingsOpen = !root.settingsOpen
+                  ToolTip.visible: containsMouse
+                  ToolTip.text: root.settingsOpen ? "Hide view picker" : "Choose a different view"
+                }
               }
 
               Text {
