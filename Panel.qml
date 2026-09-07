@@ -41,6 +41,11 @@ Panel {
       if (root.views[i].id === root.viewIdSetting) return root.views[i]
     return null
   }
+  // Unsupported views stay in `views` (so a picked view that later becomes
+  // unsupported -- e.g. a .base file edited to add a construct we don't
+  // evaluate -- is still correctly detected), but there's no point offering
+  // someone a picker row they can't click.
+  readonly property var supportedViews: root.views.filter(function (v) { return v.supported === true })
   readonly property bool viewReady: root.currentView !== null && root.currentView.supported === true
   readonly property bool viewNeeded: root.vaultActive && !root.noTaskNotes && !root.viewReady
 
@@ -483,7 +488,7 @@ Panel {
               width: parent.width
               visible: root.vaultActive && !root.noTaskNotes
               text: root.viewsLoaded
-                ? (root.views.length === 0 ? "No TaskNotes views found." : "Pick a view:")
+                ? (root.supportedViews.length === 0 ? "No views this widget can show (see README)." : "Pick a view:")
                 : "Reading TaskNotes views…"
               color: root.dim
               font.family: root.fontFamily
@@ -491,7 +496,7 @@ Panel {
             }
 
             Repeater {
-              model: root.vaultActive && !root.noTaskNotes ? root.views : []
+              model: root.vaultActive && !root.noTaskNotes ? root.supportedViews : []
 
               Item {
                 id: viewRow
@@ -500,7 +505,6 @@ Panel {
                 implicitHeight: viewRowLabel.implicitHeight + Style.space(6)
 
                 readonly property bool isCurrent: modelData.id === root.viewIdSetting
-                readonly property bool isSupported: modelData.supported === true
 
                 Rectangle {
                   anchors.fill: parent
@@ -508,8 +512,7 @@ Panel {
                   anchors.rightMargin: -Style.space(6)
                   radius: Style.cornerRadius
                   color: viewRow.isCurrent ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
-                    : (viewMouse.containsMouse && viewRow.isSupported
-                       ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
+                    : (viewMouse.containsMouse ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08) : "transparent")
                 }
 
                 Text {
@@ -517,23 +520,19 @@ Panel {
                   anchors.left: parent.left
                   anchors.right: parent.right
                   anchors.verticalCenter: parent.verticalCenter
-                  text: modelData.name + (viewRow.isSupported ? "" : "  (unsupported)")
-                  color: viewRow.isSupported ? root.foreground : root.dim
-                  opacity: viewRow.isSupported ? 1.0 : 0.6
+                  text: modelData.name
+                  color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                   font.bold: viewRow.isCurrent
                   elide: Text.ElideRight
-
-                  ToolTip.visible: !viewRow.isSupported && viewMouse.containsMouse
-                  ToolTip.text: modelData.reason || "This view uses something the widget can't safely evaluate."
                 }
 
                 MouseArea {
                   id: viewMouse
                   anchors.fill: parent
                   hoverEnabled: true
-                  cursorShape: viewRow.isSupported ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  cursorShape: Qt.PointingHandCursor
                   onClicked: root.chooseView(viewRow.modelData)
                 }
               }
