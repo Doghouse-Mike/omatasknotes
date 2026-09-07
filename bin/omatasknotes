@@ -1,0 +1,1043 @@
+#!/usr/bin/env python3
+"""Read and edit TaskNotes-format tasks in an Obsidian vault.
+
+Kept in the same spirit as m1kode/obsidian-tasks: the QML widget owns
+presentation, this owns every touch of the vault. Unlike that plugin's plain
+checkbox lines, a TaskNotes task is a whole markdown file with YAML
+frontmatter, so a "compare and swap" here is keyed on a hash of the
+frontmatter block rather than an exact line -- if the block changed since the
+scan that drew a row (Obsidian Sync, or the app itself, rewrote it), the
+write is a no-op rather than a guess.
+
+Scope, deliberately: only ever reads/writes inside the vault's configured
+TaskNotes folder. Never touches any other note, never re-serialises a whole
+frontmatter block (only the one field's own line-range is replaced), and
+never evaluates a Bases filter/formula it does not recognise exactly --
+unsupported views are reported as such, not silently miscomputed.
+"""
+import errno
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import urllib.request
+import urllib.error
+import urllib.parse
+from datetime import date, datetime, timedelta
+
+try:
+    import yaml
+except ImportError:
+    print(json.dumps({"ok": False, "error": "missing-dependency",
+                       "message": "python-yaml is required (pacman -S python-yaml)"}))
+    sys.exit(1)
+
+MAX_SCAN_FILES = 2000        # bound: a runaway/misconfigured vaultPath can't hang the widget
+MAX_ROWS = 300               # bound: popup renders at most this many rows
+MAX_COMPLETE_INSTANCES = 500 # bound: cap a recurring task's completion history
+API_TIMEOUT = 1.5            # seconds -- a hung Obsidian must never hang the widget
+
+FORBIDDEN_TOKENS = ("file(", "list(", ".filter(", ".map(", ".reduce(",
+                    "timeEntries", "&&", "||", "reminders", "googleCalendar")
+
+
+class Unsupported(Exception):
+    """A filter/formula uses a construct we deliberately do not evaluate."""
+
+
+def eprint(*a):
+    print(*a, file=sys.stderr)
+
+
+def expand(path):
+    return os.path.expanduser(path)
+
+
+# ---------------------------------------------------------------- vault ----
+
+def resolve_vault(hint):
+    hint = expand(hint.strip()) if hint else ""
+    if hint:
+        return {"path": hint, "source": "setting", "exists": os.path.isdir(hint)}
+    registries = [
+        expand("~/.config/obsidian/obsidian.json"),
+        expand("~/.var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"),
+        expand("~/snap/obsidian/current/.config/obsidian/obsidian.json"),
+    ]
+    for reg in registries:
+        try:
+            with open(reg, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        vaults = data.get("vaults", {})
+        best = None
+        for v in vaults.values():
+            if not isinstance(v, dict) or not v.get("path"):
+                continue
+            if best is None or v.get("ts", 0) > best.get("ts", 0):
+                best = v
+        if best:
+            return {"path": best["path"], "source": "obsidian", "exists": os.path.isdir(best["path"])}
+    return {"path": "", "source": "none", "exists": False}
+
+
+def tasknotes_settings(vault_path):
+    cfg_path = os.path.join(vault_path, ".obsidian", "plugins", "tasknotes", "data.json")
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# ----------------------------------------------------------- frontmatter ---
+
+FM_DELIM = re.compile(r"^---\s*$")
+
+
+def split_frontmatter(text):
+    """Return (fm_lines, body_text, fm_raw) or None if there's no frontmatter."""
+    lines = text.split("\n")
+    if not lines or not FM_DELIM.match(lines[0]):
+        return None
+    for i in range(1, len(lines)):
+        if FM_DELIM.match(lines[i]):
+            fm_lines = lines[1:i]
+            body = "\n".join(lines[i + 1:])
+            fm_raw = "\n".join(fm_lines)
+            return fm_lines, body, fm_raw
+    return None
+
+
+def fm_hash(fm_raw):
+    return hashlib.sha256(fm_raw.encode("utf-8")).hexdigest()
+
+
+def parse_frontmatter(fm_lines):
+    try:
+        data = yaml.safe_load("\n".join(fm_lines))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def field_blocks(fm_lines):
+    """Split frontmatter lines into (key, [lines]) blocks, preserving order and
+    original text exactly. A block runs from a top-level "key:" line up to
+    (not including) the next top-level key line."""
+    blocks = []
+    current_key = None
+    current_lines = []
+    key_re = re.compile(r"^([A-Za-z0-9_.\-]+):")
+    for line in fm_lines:
+        m = key_re.match(line) if line and not line[0].isspace() else None
+        if m:
+            if current_key is not None:
+                blocks.append((current_key, current_lines))
+            current_key = m.group(1)
+            current_lines = [line]
+        else:
+            if current_key is None:
+                continue  # stray line before any key (comment/blank) -- drop, never seen in practice
+            current_lines.append(line)
+    if current_key is not None:
+        blocks.append((current_key, current_lines))
+    return blocks
+
+
+def blocks_to_text(blocks):
+    out = []
+    for _key, lines in blocks:
+        out.extend(lines)
+    return "\n".join(out)
+
+
+DOC_END_MARKER_RE = re.compile(r"\n\.\.\.\s*$")
+
+
+def yaml_scalar_line(key, value):
+    # Dump only the value in flow style, then attach the key ourselves --
+    # dumping {key: value} directly would flow-style the *mapping* too,
+    # wrapping the whole line in braces instead of producing "key: value".
+    value_text = yaml.safe_dump(value, default_flow_style=True, allow_unicode=True)
+    # PyYAML appends an explicit "...\n" document-end marker whenever the
+    # top-level dumped node is a bare scalar (never for a list/dict) --
+    # left in, it becomes a second, corrupting line in the frontmatter
+    # block instead of staying part of this one field's value.
+    value_text = DOC_END_MARKER_RE.sub("", value_text).strip()
+    return "%s: %s" % (key, value_text)
+
+
+def set_field(blocks, key, value):
+    """Return a new blocks list with `key` set to `value` (single-line, flow
+    style). Replaces the block if present, else appends a new one."""
+    new_line = yaml_scalar_line(key, value)
+    out = []
+    replaced = False
+    for k, lines in blocks:
+        if k == key:
+            out.append((k, [new_line]))
+            replaced = True
+        else:
+            out.append((k, lines))
+    if not replaced:
+        out.append((key, [new_line]))
+    return out
+
+
+def atomic_write(path, content):
+    directory = os.path.dirname(path) or "."
+    try:
+        orig_mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        orig_mode = 0o644
+    fd, tmp_path = tempfile.mkstemp(prefix=".omatasknotes-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, orig_mode)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def safe_join(vault_path, rel_path):
+    """Resolve rel_path under vault_path, refusing any escape attempt."""
+    full = os.path.realpath(os.path.join(vault_path, rel_path))
+    root = os.path.realpath(vault_path)
+    if full != root and not full.startswith(root + os.sep):
+        raise ValueError("path escapes vault: %r" % rel_path)
+    return full
+
+
+# ------------------------------------------------------------- tag scan ----
+
+INLINE_TAG_RE = re.compile(r"(?<!\S)#([A-Za-z0-9_/-]+)")
+
+
+def note_tags(fm, body):
+    tags = set()
+    raw = fm.get("tags")
+    if isinstance(raw, str):
+        tags.add(raw.lstrip("#"))
+    elif isinstance(raw, list):
+        for t in raw:
+            if isinstance(t, str):
+                tags.add(t.lstrip("#"))
+    for m in INLINE_TAG_RE.finditer(body or ""):
+        tags.add(m.group(1))
+    return tags
+
+
+# --------------------------------------------------------- status/prio ----
+
+def status_lookup(settings):
+    by_value = {}
+    for s in settings.get("customStatuses") or []:
+        by_value[s.get("value")] = s
+    return by_value
+
+
+def priority_lookup(settings):
+    by_value = {}
+    for p in settings.get("customPriorities") or []:
+        by_value[p.get("value")] = p
+    return by_value
+
+
+def first_completed_status(settings):
+    statuses = sorted(settings.get("customStatuses") or [], key=lambda s: s.get("order", 0))
+    for s in statuses:
+        if s.get("isCompleted"):
+            return s.get("value")
+    return "done"
+
+
+def first_open_status(settings):
+    statuses = sorted(settings.get("customStatuses") or [], key=lambda s: s.get("order", 0))
+    for s in statuses:
+        if not s.get("isCompleted"):
+            return s.get("value")
+    return settings.get("defaultTaskStatus", "todo")
+
+
+# --------------------------------------------------------------- dates -----
+
+def parse_date(value):
+    """Best-effort parse of a due/scheduled value into a date(), or None.
+
+    PyYAML auto-converts an unquoted YYYY-MM-DD (or full ISO timestamp)
+    scalar into a real date/datetime object, and every real task file in
+    this vault writes dates unquoted -- so a plain string is only one of
+    the shapes this can arrive in, not the common one.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", value)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def date_str(value):
+    """Stringify a due/scheduled value for JSON output. PyYAML turns an
+    unquoted date/datetime scalar into a real date/datetime object, and
+    those aren't JSON-serialisable -- passing one through to json.dumps()
+    untouched would crash the scan on the first task that has one."""
+    if value is None:
+        return ""
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return str(value)
+
+
+def today_str():
+    return date.today().isoformat()
+
+
+# ---------------------------------------------------------- row model ------
+
+def build_row(rel_path, fm, body, fm_raw):
+    return {
+        "file": rel_path,
+        "fm": fm,
+        "tags": note_tags(fm, body),
+        "hash": fm_hash(fm_raw),
+    }
+
+
+# A row with no data, used only to classify a leaf expression (does it match
+# a recognised shape at all?) without needing real field values -- the
+# regexes in eval_leaf don't inspect row content to decide whether an
+# expression is *recognised*, only to decide its boolean result once it is.
+DUMMY_ROW = build_row("", {}, "", "")
+
+
+def field(row, key):
+    return row["fm"].get(key)
+
+
+def is_empty(v):
+    if v is None:
+        return True
+    if isinstance(v, str):
+        return v.strip() == ""
+    if isinstance(v, (list, dict)):
+        return len(v) == 0
+    return False
+
+
+def truthy(v):
+    return not is_empty(v) and v is not False
+
+
+# ---------------------------------------------------- leaf expression ------
+
+DATE_CMP_RE = re.compile(
+    r'^date\((\w+)\)\s*(==|!=|<=|>=|<|>)\s*today\(\)\s*(?:\+\s*"(\d+)\s*(?:d|days)?"\s*)?$')
+DATE_DOT_TODAY_RE = re.compile(r'^date\((\w+)\)\.date\(\)\s*==\s*today\(\)$')
+DATE_EMPTY_RE = re.compile(r'^date\((\w+)\)\.isEmpty\(\)$')
+FIELD_EMPTY_RE = re.compile(r'^([A-Za-z0-9_]+)\.isEmpty\(\)$')
+HAS_TAG_RE = re.compile(r'^file\.hasTag\(\s*"([^"]+)"\s*\)$')
+CONTAINS_TODAY_RE = re.compile(
+    r'^([A-Za-z0-9_]+)\.contains\(\s*today\(\)\.format\(\s*"[^"]*"\s*\)\s*\)$')
+EQ_RE = re.compile(r'^([A-Za-z0-9_.]+)\s*(==|!=)\s*"([^"]*)"$')
+BARE_FIELD_RE = re.compile(r'^([A-Za-z0-9_]+)$')
+
+
+def eval_leaf(expr, row):
+    expr = expr.strip()
+    negate = False
+    if expr.startswith("!"):
+        negate = True
+        expr = expr[1:].strip()
+
+    for token in FORBIDDEN_TOKENS:
+        if token in expr:
+            raise Unsupported("unsupported construct in %r" % expr)
+
+    result = None
+    m = HAS_TAG_RE.match(expr)
+    if m:
+        result = m.group(1) in row["tags"]
+
+    if result is None:
+        m = CONTAINS_TODAY_RE.match(expr)
+        if m:
+            v = field(row, m.group(1))
+            items = v if isinstance(v, list) else []
+            result = today_str() in [str(x) for x in items]
+
+    if result is None:
+        m = FIELD_EMPTY_RE.match(expr)
+        if m:
+            result = is_empty(field(row, m.group(1)))
+
+    if result is None:
+        m = DATE_EMPTY_RE.match(expr)
+        if m:
+            result = parse_date(field(row, m.group(1))) is None
+
+    if result is None:
+        m = DATE_DOT_TODAY_RE.match(expr)
+        if m:
+            d = parse_date(field(row, m.group(1)))
+            result = d is not None and d == date.today()
+
+    if result is None:
+        m = DATE_CMP_RE.match(expr)
+        if m:
+            fname, op, n_days = m.group(1), m.group(2), m.group(3)
+            d = parse_date(field(row, fname))
+            if d is None:
+                result = False
+            else:
+                target = date.today()
+                if n_days:
+                    target = target + timedelta(days=int(n_days))
+                result = {
+                    "==": d == target, "!=": d != target,
+                    "<": d < target, "<=": d <= target,
+                    ">": d > target, ">=": d >= target,
+                }[op]
+
+    if result is None:
+        m = EQ_RE.match(expr)
+        if m:
+            fname, op, val = m.group(1), m.group(2), m.group(3)
+            actual = field(row, fname)
+            actual_s = "" if actual is None else str(actual)
+            result = (actual_s == val) if op == "==" else (actual_s != val)
+
+    if result is None:
+        m = BARE_FIELD_RE.match(expr)
+        if m:
+            result = truthy(field(row, m.group(1)))
+
+    if result is None:
+        raise Unsupported("unrecognised expression: %r" % expr)
+
+    return (not result) if negate else result
+
+
+def eval_tree(node, row):
+    """node is a YAML-parsed filter tree: {"and":[...]} / {"or":[...]} / a
+    leaf string. Raises Unsupported if anything in it can't be evaluated.
+
+    Real evaluation only -- and/or short-circuit here on purpose. Never use
+    this to decide whether a view is *safe*: a short-circuited branch is
+    never visited, so an unsupported construct behind an early False/True
+    would slip through undetected. Use validate_tree for that."""
+    if isinstance(node, str):
+        return eval_leaf(node, row)
+    if isinstance(node, dict):
+        if "and" in node:
+            return all(eval_tree(child, row) for child in node["and"])
+        if "or" in node:
+            return any(eval_tree(child, row) for child in node["or"])
+        raise Unsupported("unrecognised filter node: %r" % node)
+    raise Unsupported("unrecognised filter node: %r" % node)
+
+
+def validate_tree(node):
+    """Visit every leaf unconditionally (no short-circuiting) and raise
+    Unsupported if any of them can't be safely evaluated. This is the only
+    correct way to decide whether a view is safe -- eval_tree's and/or use
+    real short-circuiting, which would skip checking a later leaf entirely
+    whenever an earlier one in the same and/or already decided the result."""
+    if isinstance(node, str):
+        eval_leaf(node, DUMMY_ROW)
+        return
+    if isinstance(node, dict):
+        if "and" in node:
+            for child in node["and"]:
+                validate_tree(child)
+            return
+        if "or" in node:
+            for child in node["or"]:
+                validate_tree(child)
+            return
+        raise Unsupported("unrecognised filter node: %r" % node)
+    raise Unsupported("unrecognised filter node: %r" % node)
+
+
+# ----------------------------------------------------- known formulas ------
+
+KNOWN_FORMULAS = {
+    "priorityWeight": lambda row, settings: priority_weight(row, settings),
+    "daysUntilDue": lambda row, settings: days_until(field(row, "due")),
+    "daysUntilScheduled": lambda row, settings: days_until(field(row, "scheduled")),
+    "isOverdue": lambda row, settings: (
+        parse_date(field(row, "due")) is not None
+        and parse_date(field(row, "due")) < date.today()
+        and str(field(row, "status")) not in ("done", "archived")),
+    "isDueToday": lambda row, settings: parse_date(field(row, "due")) == date.today(),
+    "isDueThisWeek": lambda row, settings: _due_this_week(row),
+    "isScheduledToday": lambda row, settings: parse_date(field(row, "scheduled")) == date.today(),
+    "isRecurring": lambda row, settings: truthy(field(row, "recurrence")),
+    "urgencyScore": lambda row, settings: urgency_score(row, settings),
+}
+
+
+def priority_weight(row, settings):
+    prios = priority_lookup(settings)
+    p = prios.get(field(row, "priority"))
+    if p is None:
+        return 999
+    return p.get("weight", 999)
+
+
+def days_until(value):
+    d = parse_date(value)
+    if d is None:
+        return None
+    return (d - date.today()).days
+
+
+def _due_this_week(row):
+    d = parse_date(field(row, "due"))
+    if d is None:
+        return False
+    today = date.today()
+    return today <= d <= today + timedelta(days=7)
+
+
+def days_until_next(row):
+    dd = days_until(field(row, "due"))
+    ds = days_until(field(row, "scheduled"))
+    if dd is not None and ds is not None:
+        return min(dd, ds)
+    return dd if dd is not None else ds
+
+
+def urgency_score(row, settings):
+    pw = priority_weight(row, settings)
+    dn = days_until_next(row)
+    if dn is None:
+        return pw
+    return pw + max(0, 10 - dn)
+
+
+def resolve_sort_key(name):
+    if name.startswith("formula."):
+        fname = name[len("formula."):]
+        if fname not in KNOWN_FORMULAS:
+            raise Unsupported("unrecognised formula: %r" % name)
+        return ("formula", fname)
+    return ("field", name)
+
+
+def sort_value(row, settings, key):
+    kind, name = key
+    if kind == "formula":
+        return KNOWN_FORMULAS[name](row, settings)
+    if name == "tasknotes_manual_order":
+        return 0
+    v = field(row, name)
+    if v is None:
+        return ""
+    return v
+
+
+# ------------------------------------------------------- view discovery ----
+
+def list_base_views(vault_path, views_dir_rel="TaskNotes/Views"):
+    views_dir = os.path.join(vault_path, views_dir_rel)
+    out = []
+    if not os.path.isdir(views_dir):
+        return out
+    try:
+        entries = sorted(os.listdir(views_dir))
+    except OSError:
+        return out
+    for name in entries:
+        if not name.endswith(".base"):
+            continue
+        rel = os.path.join(views_dir_rel, name)
+        full = os.path.join(views_dir, name)
+        try:
+            with open(full, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f.read())
+        except (OSError, yaml.YAMLError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        top_filters = doc.get("filters")
+        for v in doc.get("views") or []:
+            vname = v.get("name") or "(unnamed)"
+            vtype = v.get("type", "")
+            key = "base:%s::%s" % (rel, vname)
+            supported = True
+            reason = ""
+            if vtype not in ("tasknotesTaskList",):
+                supported, reason = False, "view type %r not shown in a list popup" % vtype
+            filters = v.get("filters", top_filters)
+            try:
+                if supported and filters is not None:
+                    # validate_tree, never eval_tree: this must visit every
+                    # leaf regardless of and/or short-circuiting, or a bad
+                    # construct hiding behind an already-decided branch would
+                    # go undetected (see validate_tree's docstring).
+                    validate_tree(filters)
+            except Unsupported as e:
+                supported, reason = False, str(e)
+            for sort_entry in v.get("sort") or []:
+                if not supported:
+                    break
+                try:
+                    resolve_sort_key(sort_entry.get("property", ""))
+                except Unsupported as e:
+                    supported, reason = False, str(e)
+            out.append({
+                "id": key, "name": vname, "source": rel,
+                "kind": "base", "supported": supported, "reason": reason,
+                "_filters": filters, "_sort": v.get("sort") or [],
+            })
+    return out
+
+
+def list_saved_views(settings):
+    out = []
+    for sv in settings.get("savedViews") or []:
+        out.append({
+            "id": "saved:%s" % sv.get("id"), "name": sv.get("name") or "(unnamed)",
+            "source": "TaskNotes settings", "kind": "saved",
+            "supported": True, "reason": "",
+            "_query": sv.get("query") or {},
+        })
+    return out
+
+
+SAVED_OP_MAP = {
+    "is": lambda a, v: str(a) == str(v),
+    "is-not": lambda a, v: str(a) != str(v),
+    "contains": lambda a, v: str(v) in (a if isinstance(a, list) else [a]) or str(v) in str(a or ""),
+    "does-not-contain": lambda a, v: not (str(v) in (a if isinstance(a, list) else [a]) or str(v) in str(a or "")),
+    "is-empty": lambda a, v: is_empty(a),
+    "is-not-empty": lambda a, v: not is_empty(a),
+    "is-checked": lambda a, v: truthy(a),
+    "is-not-checked": lambda a, v: not truthy(a),
+    "is-before": lambda a, v: (parse_date(a) or date.max) < (parse_date(v) or date.min),
+    "is-after": lambda a, v: (parse_date(a) or date.min) > (parse_date(v) or date.max),
+    "is-on-or-before": lambda a, v: (parse_date(a) or date.max) <= (parse_date(v) or date.min),
+    "is-on-or-after": lambda a, v: (parse_date(a) or date.min) >= (parse_date(v) or date.max),
+}
+
+
+def eval_saved_condition(cond, row, archive_tag):
+    prop = cond.get("property", "")
+    op = cond.get("operator", "")
+    val = cond.get("value")
+    fn = SAVED_OP_MAP.get(op)
+    if fn is None:
+        raise Unsupported("unsupported saved-view operator: %r" % op)
+    actual = (archive_tag in row["tags"]) if prop == "archived" else field(row, prop)
+    return fn(actual, val)
+
+
+def eval_saved_query(node, row, archive_tag):
+    if node.get("type") == "condition":
+        return eval_saved_condition(node, row, archive_tag)
+    if node.get("type") == "group":
+        children = node.get("children") or []
+        conj = node.get("conjunction", "and")
+        results = [eval_saved_query(c, row, archive_tag) for c in children]
+        return all(results) if conj == "and" else any(results)
+    raise Unsupported("unrecognised saved-view node")
+
+
+# ----------------------------------------------------------------- scan ----
+
+def iter_task_files(tasks_dir):
+    count = 0
+    for root, dirs, files in os.walk(tasks_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for name in sorted(files):
+            if not name.endswith(".md"):
+                continue
+            count += 1
+            if count > MAX_SCAN_FILES:
+                return
+            yield os.path.join(root, name)
+
+
+def load_task(vault_path, full_path):
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return None
+    split = split_frontmatter(text)
+    if not split:
+        return None
+    fm_lines, body, fm_raw = split
+    fm = parse_frontmatter(fm_lines)
+    rel = os.path.relpath(full_path, vault_path)
+    return build_row(rel, fm, body, fm_raw)
+
+
+def title_of(row, tasks_dir_rel):
+    t = row["fm"].get("title")
+    if isinstance(t, str) and t.strip():
+        return t
+    base = os.path.basename(row["file"])
+    return re.sub(r"\.md$", "", base)
+
+
+def cmd_scan(vault_path, view_id):
+    settings = tasknotes_settings(vault_path)
+    if settings is None:
+        print(json.dumps({"ok": False, "error": "no-tasknotes",
+                           "message": "TaskNotes plugin config not found in this vault"}))
+        return
+    tag = settings.get("taskTag", "todo")
+    tasks_dir_rel = settings.get("tasksFolder", "TaskNotes/Tasks")
+    tasks_dir = safe_join(vault_path, tasks_dir_rel)
+    if not os.path.isdir(tasks_dir):
+        print(json.dumps({"ok": False, "error": "no-folder",
+                           "message": "tasksFolder %r not found" % tasks_dir_rel}))
+        return
+
+    views = list_base_views(vault_path) + list_saved_views(settings)
+    view = next((v for v in views if v["id"] == view_id), None)
+    if view is None or not view["supported"]:
+        print(json.dumps({"ok": False, "error": "unsupported-view",
+                           "message": "view not found or unsupported"}))
+        return
+
+    rows = []
+    for full in iter_task_files(tasks_dir):
+        row = load_task(vault_path, full)
+        if row is None or tag not in row["tags"]:
+            continue
+        try:
+            if view["kind"] == "base":
+                filters = view.get("_filters")
+                if filters is not None and not eval_tree(filters, row):
+                    continue
+            else:
+                query = view.get("_query", {})
+                archive_tag = (settings.get("fieldMapping") or {}).get("archiveTag", "archived")
+                if query and not eval_saved_query(query, row, archive_tag):
+                    continue
+        except Unsupported:
+            # Shouldn't happen (dry-run already checked), but never crash the
+            # scan over one bad row -- skip it defensively instead.
+            continue
+        rows.append(row)
+
+    statuses = status_lookup(settings)
+    priorities = priority_lookup(settings)
+
+    def sort_key(row):
+        if view["kind"] == "base":
+            keys = []
+            for entry in view.get("_sort") or []:
+                try:
+                    k = resolve_sort_key(entry.get("property", ""))
+                except Unsupported:
+                    continue
+                v = sort_value(row, settings, k)
+                rev = entry.get("direction") == "DESC"
+                keys.append((v, rev))
+            return keys
+        return [(title_of(row, tasks_dir_rel), False)]
+
+    def cmp_rows(row):
+        # Python sort needs plain orderable keys; DESC handled by negating
+        # numeric values where possible, else by reversing string compare
+        # via a wrapper. Numbers dominate here (formula/due sorts), so this
+        # covers the real shipped views; ties fall back to title.
+        parts = []
+        for v, rev in sort_key(row):
+            if isinstance(v, (int, float)):
+                parts.append(-v if rev else v)
+            else:
+                parts.append(str(v))
+        parts.append(title_of(row, tasks_dir_rel))
+        return parts
+
+    try:
+        rows.sort(key=cmp_rows)
+    except TypeError:
+        rows.sort(key=lambda r: title_of(r, tasks_dir_rel))
+
+    truncated = len(rows) > MAX_ROWS
+    shown = rows[:MAX_ROWS]
+
+    out_rows = []
+    for row in shown:
+        status_val = field(row, "status")
+        st = statuses.get(status_val, {})
+        prio_val = field(row, "priority")
+        pr = priorities.get(prio_val, {})
+        recurrence = field(row, "recurrence")
+        complete_instances = field(row, "complete_instances") or []
+        done_today = truthy(recurrence) and today_str() in [str(x) for x in complete_instances]
+        is_done = bool(st.get("isCompleted")) if not truthy(recurrence) else done_today
+        out_rows.append({
+            "file": row["file"],
+            "hash": row["hash"],
+            "title": title_of(row, tasks_dir_rel),
+            "status": "" if status_val is None else str(status_val),
+            "statusLabel": st.get("label") or ("" if status_val is None else str(status_val)),
+            "isCompleted": is_done,
+            "priority": "" if prio_val is None else str(prio_val),
+            "priorityLabel": pr.get("label") or ("" if prio_val is None else str(prio_val)),
+            "due": date_str(field(row, "due")),
+            "scheduled": date_str(field(row, "scheduled")),
+            "recurring": truthy(recurrence),
+        })
+
+    print(json.dumps({"ok": True, "rows": out_rows, "truncated": truncated,
+                       "total": len(rows)}))
+
+
+def cmd_views(vault_path):
+    settings = tasknotes_settings(vault_path)
+    if settings is None:
+        print(json.dumps({"ok": False, "error": "no-tasknotes"}))
+        return
+    views = list_base_views(vault_path) + list_saved_views(settings)
+    print(json.dumps({"ok": True, "views": [
+        {"id": v["id"], "name": v["name"], "source": v["source"],
+         "supported": v["supported"], "reason": v["reason"]}
+        for v in views
+    ]}))
+
+
+# ------------------------------------------------------------- API bonus ---
+
+def api_base(settings):
+    if not settings.get("enableAPI"):
+        return None
+    port = settings.get("apiPort", 8080)
+    return "http://127.0.0.1:%s" % port
+
+
+def api_request(settings, method, path, payload=None):
+    base = api_base(settings)
+    if base is None:
+        return None
+    url = base + path
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    token = settings.get("apiAuthToken") or ""
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
+            body = resp.read(1 << 20)  # bound: never read an unbounded response
+            return json.loads(body.decode("utf-8"))
+    except Exception:
+        return None  # any failure -> caller falls back to direct file write
+
+
+def api_health_ok(settings):
+    return api_request(settings, "GET", "/api/health") is not None
+
+
+# ------------------------------------------------------------ mutations ----
+
+def cmd_complete(vault_path, rel_path, expected_hash):
+    _mutate(vault_path, rel_path, expected_hash, make_done=True)
+
+
+def cmd_uncomplete(vault_path, rel_path, expected_hash, restore_mode, restore_value):
+    _mutate(vault_path, rel_path, expected_hash, make_done=False,
+             restore_mode=restore_mode, restore_value=restore_value)
+
+
+def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, restore_value=None):
+    settings = tasknotes_settings(vault_path)
+    if settings is None:
+        print(json.dumps({"ok": False, "error": "no-tasknotes"}))
+        return
+    try:
+        full = safe_join(vault_path, rel_path)
+    except ValueError as e:
+        print(json.dumps({"ok": False, "error": "bad-path", "message": str(e)}))
+        return
+    tasks_dir = safe_join(vault_path, settings.get("tasksFolder", "TaskNotes/Tasks"))
+    if not full.startswith(tasks_dir + os.sep) and full != tasks_dir:
+        print(json.dumps({"ok": False, "error": "out-of-scope",
+                           "message": "refusing to write outside the configured tasks folder"}))
+        return
+
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": "read-failed", "message": str(e)}))
+        return
+    split = split_frontmatter(text)
+    if not split:
+        print(json.dumps({"ok": False, "error": "no-frontmatter"}))
+        return
+    fm_lines, body, fm_raw = split
+    if fm_hash(fm_raw) != expected_hash:
+        print(json.dumps({"ok": False, "error": "stale",
+                           "message": "task changed on disk since it was scanned"}))
+        return
+    fm = parse_frontmatter(fm_lines)
+    recurring = truthy(fm.get("recurrence"))
+    blocks = field_blocks(fm_lines)
+    prev_status = fm.get("status")
+
+    api_ok = api_health_ok(settings)
+    api_payload = {}
+
+    if recurring:
+        raw_instances = fm.get("complete_instances") or []
+        # Coerce every entry to str (not filter to str): PyYAML turns an
+        # unquoted YYYY-MM-DD into a real date object, and dropping those
+        # instead of stringifying them would silently erase history.
+        instances = [str(x) for x in raw_instances][-MAX_COMPLETE_INSTANCES:]
+        today = today_str()
+        if make_done:
+            if today not in instances:
+                instances = (instances + [today])[-MAX_COMPLETE_INSTANCES:]
+            new_result = {"restoreMode": "instance", "restoreValue": today}
+        else:
+            target = restore_value or today
+            instances = [d for d in instances if d != target]
+            new_result = {}
+        blocks = set_field(blocks, "complete_instances", instances)
+        api_payload = {"complete_instances": instances}
+    else:
+        if make_done:
+            new_status = first_completed_status(settings)
+            new_result = {"restoreMode": "status", "restoreValue": prev_status}
+        else:
+            new_status = restore_value if restore_value else first_open_status(settings)
+            new_result = {}
+        blocks = set_field(blocks, "status", new_status)
+        api_payload = {"status": new_status}
+
+    new_fm_text = blocks_to_text(blocks)
+    new_text = "---\n" + new_fm_text + "\n---\n" + body
+
+    try:
+        atomic_write(full, new_text)
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": "write-failed", "message": str(e)}))
+        return
+
+    if api_ok:
+        # Best-effort only: the file write above is already the source of
+        # truth and has already succeeded: this just gives Obsidian's own
+        # running instance a nudge via its own logic (e.g. auto-archive on
+        # complete). A failure here is silently ignored.
+        try:
+            api_request(settings, "PUT", "/api/tasks/" + urllib.parse.quote(rel_path, safe=""),
+                        api_payload)
+        except Exception:
+            pass
+
+    with open(full, "r", encoding="utf-8") as f:
+        final_text = f.read()
+    final_split = split_frontmatter(final_text)
+    new_hash = fm_hash(final_split[2]) if final_split else ""
+
+    result = {"ok": True, "hash": new_hash}
+    result.update(new_result)
+    print(json.dumps(result))
+
+
+def cmd_create(vault_path, title):
+    settings = tasknotes_settings(vault_path)
+    if settings is None:
+        print(json.dumps({"ok": False, "error": "no-tasknotes"}))
+        return
+    tasks_dir_rel = settings.get("tasksFolder", "TaskNotes/Tasks")
+    tasks_dir = safe_join(vault_path, tasks_dir_rel)
+    try:
+        os.makedirs(tasks_dir, exist_ok=True)
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": "mkdir-failed", "message": str(e)}))
+        return
+
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", title).strip("-").lower() or "task"
+    slug = slug[:80]
+    candidate = slug
+    n = 1
+    while os.path.exists(os.path.join(tasks_dir, candidate + ".md")):
+        n += 1
+        candidate = "%s-%d" % (slug, n)
+    full = os.path.join(tasks_dir, candidate + ".md")
+
+    tag = settings.get("taskTag", "todo")
+    status = settings.get("defaultTaskStatus", "todo")
+    priority = settings.get("defaultTaskPriority", "normal")
+    now = datetime.now().isoformat()
+    fm = {
+        "title": title,
+        "status": status,
+        "priority": priority,
+        "tags": [tag],
+        "dateCreated": now,
+    }
+    text = "---\n" + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True) + "---\n"
+    try:
+        fd = os.open(full, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        print(json.dumps({"ok": False, "error": "write-failed", "message": str(e)}))
+        return
+    print(json.dumps({"ok": True, "file": os.path.relpath(full, vault_path)}))
+
+
+# ------------------------------------------------------------------ main ---
+
+def main(argv):
+    if len(argv) < 2:
+        eprint("usage: omatasknotes <vault|views|scan|complete|uncomplete|create> ...")
+        return 2
+    cmd = argv[1]
+    try:
+        if cmd == "vault":
+            print(json.dumps(resolve_vault(argv[2] if len(argv) > 2 else "")))
+        elif cmd == "views":
+            cmd_views(expand(argv[2]))
+        elif cmd == "scan":
+            cmd_scan(expand(argv[2]), argv[3])
+        elif cmd == "complete":
+            cmd_complete(expand(argv[2]), argv[3], argv[4])
+        elif cmd == "uncomplete":
+            mode = argv[5] if len(argv) > 5 else ""
+            value = argv[6] if len(argv) > 6 else ""
+            cmd_uncomplete(expand(argv[2]), argv[3], argv[4], mode, value)
+        elif cmd == "create":
+            cmd_create(expand(argv[2]), argv[3])
+        else:
+            eprint("unknown command: %s" % cmd)
+            return 2
+    except Exception as e:  # last-resort guard: never let the widget hang on a crash
+        print(json.dumps({"ok": False, "error": "internal", "message": str(e)}))
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
