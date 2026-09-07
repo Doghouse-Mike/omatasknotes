@@ -3,7 +3,7 @@
   "id": "doghouse-mike.omatasknotes",
   "name": "OmaTaskNotes",
   "version": "0.1.0",
-  "author": "Mike Guyan-Linnett",
+  "author": "Doghouse-Mike",
   "license": "MIT",
   "description": "Obsidian TaskNotes tasks from a local vault, in the Omarchy bar -- pick any of TaskNotes' own configured views.",
   "kinds": [
