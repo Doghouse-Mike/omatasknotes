@@ -127,6 +127,13 @@ place) so a crash mid-write can never leave a half-written task behind.
 
 The vault is rescanned every 60s and whenever the popup opens.
 
+## Interactions
+
+Click the checkbox to complete/uncomplete a task. Right-click a task's title
+to open its note directly in Obsidian, via Obsidian's own built-in `obsidian://open`
+URI (no Advanced URI plugin needed) -- useful for anything the popup itself
+doesn't expose, like renaming a task or editing its body.
+
 ## Settings
 
 From the widget's entry in `~/.config/omarchy/shell.json`:
@@ -144,7 +151,7 @@ folder.
 
 ## Not yet supported
 
-- Renaming a task from the popup (open the note in Obsidian to retitle it).
+- Renaming a task from the popup (right-click it to open the note in Obsidian and retitle it there).
 - Natural-language dates in the quick-add box -- it only sets a title for
   now; set the due date in Obsidian afterwards.
 - Views whose type isn't a flat list (Kanban, calendar, ...), or whose

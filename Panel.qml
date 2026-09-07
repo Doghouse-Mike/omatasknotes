@@ -155,6 +155,18 @@ Panel {
     editProc.running = true
   }
 
+  function openInObsidian(task) {
+    // Obsidian's own core "open" URI action, not the Advanced URI plugin --
+    // `path=<absolute path>` needs no vault name/id, Obsidian resolves which
+    // vault contains it. xdg-open dispatches to whatever's registered for
+    // the obsidian:// scheme, same as clicking a link.
+    if (!task || !task.file || root.vaultPath === "") return
+    var absPath = root.vaultPath + "/" + task.file
+    var uri = "obsidian://open?path=" + encodeURIComponent(absPath)
+    openNoteProc.command = ["xdg-open", uri]
+    openNoteProc.running = true
+  }
+
   function undoTask(entry) {
     if (!entry || editProc.running) return
     root.justDone = root.justDone.filter(function (e) { return e.file !== entry.file })
@@ -218,6 +230,10 @@ Panel {
   Process {
     id: setVaultProc
     onExited: root.resolveVault()
+  }
+
+  Process {
+    id: openNoteProc
   }
 
   Process {
@@ -605,8 +621,12 @@ Panel {
                 MouseArea {
                   id: labelMouse
                   anchors.fill: parent
-                  enabled: false
                   hoverEnabled: true
+                  acceptedButtons: Qt.RightButton
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.openInObsidian(row.modelData)
+                  ToolTip.visible: containsMouse
+                  ToolTip.text: "Right-click: open in Obsidian"
                 }
               }
 
