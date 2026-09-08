@@ -6,7 +6,7 @@ through them, and a picker for whichever TaskNotes **view** you want to see
 (Today, Overdue, This Week, a saved view -- anything TaskNotes itself can
 show as a list).
 
-This is a TaskNotes-aware sibling to
+This is a TaskNotes-aware rival/replacement to
 [m1kode/obsidian-tasks](https://github.com/m1kode/obsidian-tasks), which
 reads the simpler Obsidian *Tasks* plugin's checkbox syntax. TaskNotes stores
 each task as its own note with YAML frontmatter, and its views are defined
@@ -91,7 +91,7 @@ of it. It faithfully evaluates:
 - TaskNotes' own shipped default formulas by name (`priorityWeight`,
   `urgencyScore`, and friends), matched against their known-good expression
   text -- if you've customised one, the view it's used in is treated as
-  unrecognised rather than silently miscomputed
+  unrecognised rather than silently donked
 - any view type that isn't a plain task list (Kanban board, calendar,
   pomodoro stats, ...) isn't shown here at all -- a bar popup can't render
   those meaningfully as a flat list
