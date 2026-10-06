@@ -42,6 +42,13 @@ TaskNotes' views are real YAML (Obsidian's "Bases" format), and getting that
 parsing right needs an actual YAML parser rather than a hand-rolled one. If
 it's missing, the widget says so plainly rather than guessing.
 
+Ticking a **repeating** task also needs **`python-dateutil`**
+(`pacman -S python-dateutil`, usually already installed) to work out the next
+occurrence. Ticks are written exactly as TaskNotes writes them: a one-off task
+gets its completed status, `completedDate` and `dateModified`; a repeating
+task completes its current occurrence and moves on to the next one. Undo
+puts the note back exactly as it was.
+
 To remove it:
 
 ```bash

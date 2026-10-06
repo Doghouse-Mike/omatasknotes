@@ -189,6 +189,108 @@ def set_field(blocks, key, value):
     return out
 
 
+def remove_field(blocks, key):
+    return [(k, lines) for k, lines in blocks if k != key]
+
+
+def now_ts():
+    """TaskNotes' timestamp format: local, 3 fractional digits, +HH:MM."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+# ----------------------------------------------------------- recurrence ----
+# TaskNotes semantics (rrule.js in floating time, compared as calendar
+# dates), ported from OmaForge's core/omaforge/recurrence.py. Needs
+# python-dateutil, imported only when a repeating task is ticked.
+
+DTSTART_RE = re.compile(r"DTSTART:(\d{8}(?:T\d{6}Z?)?)")
+
+
+def _rrule(rule, fallback_start):
+    from dateutil.rrule import rrulestr
+    rule = str(rule or "").strip()
+    m = DTSTART_RE.search(rule)
+    start = None
+    if m:
+        for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%d"):
+            try:
+                start = datetime.strptime(m.group(1), fmt)
+                break
+            except ValueError:
+                pass
+    body = re.sub(r"DTSTART:[^;]+;?", "", rule).strip().lstrip(";")
+    if body.upper().startswith("RRULE:"):
+        body = body[6:]
+    parts = dict(c.split("=", 1) for c in body.split(";") if "=" in c)
+    parts = {k.strip().upper(): v.strip() for k, v in parts.items()}
+    if "FREQ" not in parts:
+        return None, None, parts
+    if start is None:
+        if fallback_start is None:
+            return None, None, parts
+        start = datetime(fallback_start.year, fallback_start.month, fallback_start.day)
+    body = re.sub(r"UNTIL=([0-9TZ]+)",
+                  lambda u: "UNTIL=" + (u.group(1) + "T000000" if len(u.group(1)) == 8 else u.group(1)).rstrip("Z"),
+                  body)
+    try:
+        return rrulestr(body, dtstart=start), start, parts
+    except (ValueError, TypeError):
+        return None, None, parts
+
+
+def _lookahead(parts):
+    try:
+        i = max(1, int(parts.get("INTERVAL", "1")))
+    except ValueError:
+        i = 1
+    return {"DAILY": max(30, 2 * i), "WEEKLY": max(90, 14 * i), "MONTHLY": max(400, 62 * i),
+            "YEARLY": max(800, 732 * i)}.get(parts.get("FREQ"), 365)
+
+
+def _occurrences(r, start_day, end_day):
+    lo = datetime(start_day.year, start_day.month, start_day.day)
+    hi = datetime(end_day.year, end_day.month, end_day.day, 23, 59, 59)
+    return [o.date() for o in r.between(lo, hi, inc=True)]
+
+
+def recurring_instance(rule, target, completed, skipped, anchor, fallback_start):
+    """Which occurrence a tick on `target` completes (TaskNotes §4.4)."""
+    t = date.fromisoformat(target)
+    if anchor == "completion":
+        return target
+    r, _start, parts = _rrule(rule, fallback_start)
+    if r is None or _occurrences(r, t, t):
+        return target
+    processed = set(completed) | set(skipped)
+    for o in reversed(_occurrences(r, t - timedelta(days=_lookahead(parts)), t)):
+        if o.isoformat() not in processed:
+            return o.isoformat()
+    for o in _occurrences(r, t, t + timedelta(days=_lookahead(parts))):
+        if o.isoformat() not in set(completed):
+            return o.isoformat()
+    return target
+
+
+def next_open_occurrence(rule, floor, completed, skipped, anchor, fallback_start):
+    """First occurrence >= floor neither completed nor skipped (§4.5)."""
+    f = date.fromisoformat(floor)
+    r, start, parts = _rrule(rule, fallback_start or f)
+    if r is None:
+        return None
+    sd = start.date()
+    if anchor == "completion":
+        for o in _occurrences(r, sd, sd + timedelta(days=_lookahead(parts))):
+            if o > sd and o >= f and o.isoformat() not in set(skipped):
+                return o.isoformat()
+        return None
+    lo = sd if sd < f else f
+    processed = set(completed) | set(skipped)
+    for o in _occurrences(r, lo, f + timedelta(days=_lookahead(parts))):
+        if o >= f and o.isoformat() not in processed:
+            return o.isoformat()
+    return None
+
+
 def atomic_write(path, content):
     directory = os.path.dirname(path) or "."
     try:
@@ -261,6 +363,13 @@ def first_completed_status(settings):
         if s.get("isCompleted"):
             return s.get("value")
     return "done"
+
+
+def is_completed_status(settings, value):
+    for s in settings.get("customStatuses") or []:
+        if s.get("value") == value:
+            return bool(s.get("isCompleted"))
+    return False
 
 
 def first_open_status(settings):
@@ -907,32 +1016,86 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
     api_ok = api_health_ok(settings)
     api_payload = {}
 
+    # Mirrors what TaskNotes itself writes (see OmaForge docs/tasknotes-spec.md):
+    # every write bumps dateModified; completing a non-repeating task stamps
+    # completedDate; a repeating task completes its *current occurrence* and
+    # moves on to the next one, its status untouched.
+    today = today_str()
     if recurring:
-        raw_instances = fm.get("complete_instances") or []
-        # Coerce every entry to str (not filter to str): PyYAML turns an
-        # unquoted YYYY-MM-DD into a real date object, and dropping those
-        # instead of stringifying them would silently erase history.
-        instances = [str(x) for x in raw_instances][-MAX_COMPLETE_INSTANCES:]
-        today = today_str()
+        try:
+            import dateutil  # noqa: F401
+        except ImportError:
+            print(json.dumps({"ok": False, "error": "missing-dependency",
+                               "message": "python-dateutil is needed to tick repeating tasks (pacman -S python-dateutil)"}))
+            return
+        before = {k: fm.get(k) for k in ("scheduled", "due", "complete_instances", "skipped_instances", "recurrence")}
         if make_done:
-            if today not in instances:
-                instances = (instances + [today])[-MAX_COMPLETE_INSTANCES:]
-            new_result = {"restoreMode": "instance", "restoreValue": today}
+            completed = [date_str(x)[:10] for x in (fm.get("complete_instances") or [])]
+            skipped = [date_str(x)[:10] for x in (fm.get("skipped_instances") or [])]
+            scheduled = date_str(fm.get("scheduled"))
+            due = date_str(fm.get("due"))
+            anchor = "completion" if str(fm.get("recurrence_anchor") or "") == "completion" else "scheduled"
+            fallback = parse_date(scheduled) or parse_date(fm.get("dateCreated"))
+            rule = str(fm.get("recurrence"))
+            target = today if anchor == "completion" else (scheduled[:10] or due[:10] or today)
+            inst = recurring_instance(rule, target, completed, skipped, anchor, fallback)
+            if inst in completed:
+                completed.remove(inst)   # TaskNotes toggles an already-done occurrence
+            else:
+                completed = (completed + [inst])[-MAX_COMPLETE_INSTANCES:]
+                skipped = [d for d in skipped if d != inst]
+                if anchor == "completion":
+                    # Completion-anchored: the rule restarts from when it was done.
+                    m = DTSTART_RE.search(rule)
+                    rule = (DTSTART_RE.sub("DTSTART:" + inst.replace("-", "") + m.group(1)[8:], rule, count=1)
+                            if m else "DTSTART:%s;%s" % (inst.replace("-", ""), rule))
+                    blocks = set_field(blocks, "recurrence", rule)
+            blocks = set_field(blocks, "complete_instances", completed)
+            blocks = set_field(blocks, "skipped_instances", skipped)
+            suffix = scheduled[10:] if len(scheduled) > 10 else ""
+            work_sched = scheduled if anchor == "completion" else inst + suffix
+            nxt = next_open_occurrence(rule, max(today, inst), completed, skipped, anchor, fallback)
+            if nxt:
+                blocks = set_field(blocks, "scheduled", nxt + suffix)
+                if due and work_sched and due[:10] < nxt:
+                    try:
+                        delta = date.fromisoformat(due[:10]) - date.fromisoformat(work_sched[:10])
+                        blocks = set_field(blocks, "due", (date.fromisoformat(nxt) + delta).isoformat() + due[10:])
+                    except ValueError:
+                        pass
+            # Undo restores exactly this state (TaskNotes' own un-complete
+            # re-advances instead, which can't bring back an overdue date).
+            new_result = {"restoreMode": "recurring",
+                          "restoreValue": json.dumps({k: (v if not isinstance(v, (date, datetime)) else date_str(v))
+                                                      if not isinstance(v, list) else [date_str(x) for x in v]
+                                                      for k, v in before.items()})}
         else:
-            target = restore_value or today
-            instances = [d for d in instances if d != target]
+            try:
+                prev = json.loads(restore_value) if restore_mode == "recurring" and restore_value else None
+            except ValueError:
+                prev = None
+            if not isinstance(prev, dict):
+                print(json.dumps({"ok": False, "error": "no-undo", "message": "nothing to restore"}))
+                return
+            for k in ("scheduled", "due", "complete_instances", "skipped_instances", "recurrence"):
+                if k not in prev:
+                    continue
+                v = prev.get(k)
+                blocks = remove_field(blocks, k) if v is None else set_field(blocks, k, v)
             new_result = {}
-        blocks = set_field(blocks, "complete_instances", instances)
-        api_payload = {"complete_instances": instances}
     else:
         if make_done:
             new_status = first_completed_status(settings)
             new_result = {"restoreMode": "status", "restoreValue": prev_status}
+            blocks = set_field(blocks, "completedDate", today)
         else:
             new_status = restore_value if restore_value else first_open_status(settings)
             new_result = {}
+            if not is_completed_status(settings, new_status):
+                blocks = remove_field(blocks, "completedDate")
         blocks = set_field(blocks, "status", new_status)
         api_payload = {"status": new_status}
+    blocks = set_field(blocks, "dateModified", now_ts())
 
     new_fm_text = blocks_to_text(blocks)
     new_text = "---\n" + new_fm_text + "\n---\n" + body
@@ -943,7 +1106,7 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
         print(json.dumps({"ok": False, "error": "write-failed", "message": str(e)}))
         return
 
-    if api_ok:
+    if api_ok and api_payload:
         # Best-effort only: the file write above is already the source of
         # truth and has already succeeded: this just gives Obsidian's own
         # running instance a nudge via its own logic (e.g. auto-archive on
