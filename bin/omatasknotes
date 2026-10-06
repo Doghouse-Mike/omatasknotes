@@ -989,13 +989,18 @@ def cmd_create(vault_path, title):
     tag = settings.get("taskTag", "todo")
     status = settings.get("defaultTaskStatus", "todo")
     priority = settings.get("defaultTaskPriority", "normal")
-    now = datetime.now().isoformat()
+    # Match TaskNotes' own format: local time, 3 fractional digits, +HH:MM
+    # offset (a bare isoformat() gives 6 digits and no offset, which
+    # TaskNotes' strict datetime parser doesn't accept). TaskNotes also
+    # always writes dateModified alongside dateCreated.
+    now = datetime.now().astimezone().isoformat(timespec="milliseconds")
     fm = {
         "title": title,
         "status": status,
         "priority": priority,
         "tags": [tag],
         "dateCreated": now,
+        "dateModified": now,
     }
     text = "---\n" + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True) + "---\n"
     try:
