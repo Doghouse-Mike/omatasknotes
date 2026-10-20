@@ -324,6 +324,18 @@ Panel {
     }
   }
 
+  // Backstop for the helper's own 20s deadline (e.g. stuck on a dead network
+  // mount, where its alarm can't fire): stop any run still going at 30s so a
+  // hung helper can't leave the widget waiting forever.
+  Timer {
+    interval: 30000
+    running: vaultProc.running || viewsProc.running || scanProc.running || editProc.running
+    onTriggered: {
+      for (const proc of [vaultProc, viewsProc, scanProc, editProc])
+        if (proc.running) proc.running = false
+    }
+  }
+
   Timer {
     interval: root.refreshIntervalSec * 1000
     running: true

@@ -17,9 +17,11 @@ unsupported views are reported as such, not silently miscomputed.
 """
 import errno
 import hashlib
+import io
 import json
 import os
 import re
+import signal
 import stat
 import sys
 import tempfile
@@ -39,6 +41,18 @@ MAX_SCAN_FILES = 2000        # bound: a runaway/misconfigured vaultPath can't ha
 MAX_ROWS = 300               # bound: popup renders at most this many rows
 MAX_COMPLETE_INSTANCES = 500 # bound: cap a recurring task's completion history
 API_TIMEOUT = 1.5            # seconds -- a hung Obsidian must never hang the widget
+# The vault may be shared or synced, so everything read from it is treated as
+# untrusted: each file, string and the total output handed to the shell is
+# bounded, and the whole run has a deadline.
+MAX_NOTE_BYTES = 256 * 1024      # bound: one task note or .base file
+MAX_SETTINGS_BYTES = 4 * 1024 * 1024  # bound: TaskNotes' data.json
+MAX_BASE_FILES = 200         # bound: .base files read per views listing
+MAX_VIEWS = 200              # bound: views offered in the picker
+MAX_VIEW_NAME = 200          # views with longer names/ids are skipped, not clipped (the id must round-trip)
+MAX_TITLE = 300              # bound: characters of a title shown in a row
+MAX_LABEL = 100              # bound: characters of any other displayed string
+MAX_OUTPUT = 2 * 1024 * 1024 # bound: bytes of JSON the shell has to buffer and parse
+DEADLINE_SEC = 20            # bound: wall-clock time for one helper run
 
 FORBIDDEN_TOKENS = ("file(", "list(", ".filter(", ".map(", ".reduce(",
                     "timeEntries", "&&", "||", "reminders", "googleCalendar")
@@ -54,6 +68,62 @@ def eprint(*a):
 
 def expand(path):
     return os.path.expanduser(path)
+
+
+def clip(value, limit=MAX_LABEL):
+    s = "" if value is None else str(value)
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def read_text(path, limit=MAX_NOTE_BYTES):
+    """Read a regular file of at most `limit` bytes as UTF-8, else OSError.
+
+    Refuses symlinks (O_NOFOLLOW) and anything that isn't a regular file
+    (FIFOs, devices, sockets) without blocking on it (O_NONBLOCK), so a
+    planted `x.md -> /dev/zero` or a named pipe can't hang or exhaust the
+    helper.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.EINVAL, "not a regular file", path)
+        if st.st_size > limit:
+            raise OSError(errno.EFBIG, "file too large", path)
+        chunks, total = [], 0
+        while total <= limit:
+            chunk = os.read(fd, min(65536, limit + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > limit:
+            raise OSError(errno.EFBIG, "file too large", path)
+    finally:
+        os.close(fd)
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeDecodeError:
+        raise OSError(errno.EILSEQ, "not valid UTF-8", path)
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that rejects YAML aliases.
+
+    Aliases are shared references while parsed, but every consumer here
+    (json.dumps, the filter evaluator) walks them out in full, so a nested
+    alias "billion laughs" block would expand exponentially. Nothing
+    TaskNotes or Bases writes uses them.
+    """
+
+    def compose_node(self, parent, index):
+        if self.check_event(yaml.AliasEvent):
+            raise yaml.YAMLError("YAML aliases are not supported")
+        return super().compose_node(parent, index)
+
+
+def load_yaml(text):
+    return yaml.load(text, Loader=_NoAliasLoader)
 
 
 # ---------------------------------------------------------------- vault ----
@@ -88,10 +158,10 @@ def resolve_vault(hint):
 def tasknotes_settings(vault_path):
     cfg_path = os.path.join(vault_path, ".obsidian", "plugins", "tasknotes", "data.json")
     try:
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        data = json.loads(read_text(cfg_path, MAX_SETTINGS_BYTES))
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 # ----------------------------------------------------------- frontmatter ---
@@ -119,7 +189,7 @@ def fm_hash(fm_raw):
 
 def parse_frontmatter(fm_lines):
     try:
-        data = yaml.safe_load("\n".join(fm_lines))
+        data = load_yaml("\n".join(fm_lines))
     except yaml.YAMLError:
         return {}
     return data if isinstance(data, dict) else {}
@@ -678,21 +748,22 @@ def list_base_views(vault_path, views_dir_rel="TaskNotes/Views"):
         entries = sorted(os.listdir(views_dir))
     except OSError:
         return out
+    entries = [name for name in entries if name.endswith(".base")][:MAX_BASE_FILES]
     for name in entries:
-        if not name.endswith(".base"):
-            continue
         rel = os.path.join(views_dir_rel, name)
         full = os.path.join(views_dir, name)
         try:
-            with open(full, "r", encoding="utf-8") as f:
-                doc = yaml.safe_load(f.read())
+            doc = load_yaml(read_text(full))
         except (OSError, yaml.YAMLError):
             continue
         if not isinstance(doc, dict):
             continue
         top_filters = doc.get("filters")
-        for v in doc.get("views") or []:
-            vname = v.get("name") or "(unnamed)"
+        views = doc.get("views")
+        for v in views if isinstance(views, list) else []:
+            if not isinstance(v, dict):
+                continue
+            vname = str(v.get("name") or "(unnamed)")
             vtype = v.get("type", "")
             key = "base:%s::%s" % (rel, vname)
             supported = True
@@ -726,9 +797,12 @@ def list_base_views(vault_path, views_dir_rel="TaskNotes/Views"):
 
 def list_saved_views(settings):
     out = []
-    for sv in settings.get("savedViews") or []:
+    saved = settings.get("savedViews")
+    for sv in saved if isinstance(saved, list) else []:
+        if not isinstance(sv, dict):
+            continue
         out.append({
-            "id": "saved:%s" % sv.get("id"), "name": sv.get("name") or "(unnamed)",
+            "id": "saved:%s" % sv.get("id"), "name": str(sv.get("name") or "(unnamed)"),
             "source": "TaskNotes settings", "kind": "saved",
             "supported": True, "reason": "",
             "_query": sv.get("query") or {},
@@ -791,8 +865,7 @@ def iter_task_files(tasks_dir):
 
 def load_task(vault_path, full_path):
     try:
-        with open(full_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = read_text(full_path)
     except OSError:
         return None
     split = split_frontmatter(text)
@@ -823,7 +896,7 @@ def cmd_scan(vault_path, view_id):
     tasks_dir = safe_join(vault_path, tasks_dir_rel)
     if not os.path.isdir(tasks_dir):
         print(json.dumps({"ok": False, "error": "no-folder",
-                           "message": "tasksFolder %r not found" % tasks_dir_rel}))
+                           "message": "tasksFolder %r not found" % clip(tasks_dir_rel)}))
         return
 
     views = list_base_views(vault_path) + list_saved_views(settings)
@@ -906,14 +979,14 @@ def cmd_scan(vault_path, view_id):
         out_rows.append({
             "file": row["file"],
             "hash": row["hash"],
-            "title": title_of(row, tasks_dir_rel),
-            "status": "" if status_val is None else str(status_val),
-            "statusLabel": st.get("label") or ("" if status_val is None else str(status_val)),
+            "title": clip(title_of(row, tasks_dir_rel), MAX_TITLE),
+            "status": clip(status_val),
+            "statusLabel": clip(st.get("label") or status_val),
             "isCompleted": is_done,
-            "priority": "" if prio_val is None else str(prio_val),
-            "priorityLabel": pr.get("label") or ("" if prio_val is None else str(prio_val)),
-            "due": date_str(field(row, "due")),
-            "scheduled": date_str(field(row, "scheduled")),
+            "priority": clip(prio_val),
+            "priorityLabel": clip(pr.get("label") or prio_val),
+            "due": clip(date_str(field(row, "due"))),
+            "scheduled": clip(date_str(field(row, "scheduled"))),
             "recurring": truthy(recurrence),
         })
 
@@ -927,9 +1000,14 @@ def cmd_views(vault_path):
         print(json.dumps({"ok": False, "error": "no-tasknotes"}))
         return
     views = list_base_views(vault_path) + list_saved_views(settings)
+    # A view's id embeds its name and is written back as the viewId setting,
+    # so an over-long one is dropped rather than clipped into an id that
+    # would never match again.
+    views = [v for v in views
+             if len(v["name"]) <= MAX_VIEW_NAME and len(v["id"]) <= MAX_VIEW_NAME * 2][:MAX_VIEWS]
     print(json.dumps({"ok": True, "views": [
-        {"id": v["id"], "name": v["name"], "source": v["source"],
-         "supported": v["supported"], "reason": v["reason"]}
+        {"id": v["id"], "name": v["name"], "source": clip(v["source"]),
+         "supported": v["supported"], "reason": clip(v["reason"], MAX_TITLE)}
         for v in views
     ]}))
 
@@ -939,8 +1017,18 @@ def cmd_views(vault_path):
 def api_base(settings):
     if not settings.get("enableAPI"):
         return None
+    # data.json syncs with the vault, so the port is checked rather than
+    # trusted: the auth token goes to it.
     port = settings.get("apiPort", 8080)
-    return "http://127.0.0.1:%s" % port
+    if isinstance(port, bool) or not isinstance(port, (int, str)):
+        return None
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    return "http://127.0.0.1:%d" % port
 
 
 def api_request(settings, method, path, payload=None):
@@ -994,8 +1082,7 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
         return
 
     try:
-        with open(full, "r", encoding="utf-8") as f:
-            text = f.read()
+        text = read_text(full)
     except OSError as e:
         print(json.dumps({"ok": False, "error": "read-failed", "message": str(e)}))
         return
@@ -1117,8 +1204,7 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
         except Exception:
             pass
 
-    with open(full, "r", encoding="utf-8") as f:
-        final_text = f.read()
+    final_text = read_text(full)
     final_split = split_frontmatter(final_text)
     new_hash = fm_hash(final_split[2]) if final_split else ""
 
@@ -1183,6 +1269,27 @@ def main(argv):
         eprint("usage: omatasknotes <vault|views|scan|complete|uncomplete|create> ...")
         return 2
     cmd = argv[1]
+    signal.signal(signal.SIGALRM, _deadline)
+    signal.alarm(DEADLINE_SEC)
+    real_stdout, sys.stdout = sys.stdout, io.StringIO()
+    try:
+        return _run(cmd, argv)
+    finally:
+        signal.alarm(0)
+        out, sys.stdout = sys.stdout.getvalue(), real_stdout
+        if len(out.encode("utf-8")) > MAX_OUTPUT:
+            out = json.dumps({"ok": False, "error": "too-large",
+                              "message": "too much to show from this vault"}) + "\n"
+        sys.stdout.write(out)
+
+
+def _deadline(signum, frame):
+    raise TimeoutError("took longer than %ds" % DEADLINE_SEC)
+
+
+def _run(cmd, argv):
+    # TimeoutError from the deadline lands in the last-resort guard below,
+    # after atomic_write's own handler has removed any half-written temp file.
     try:
         if cmd == "vault":
             print(json.dumps(resolve_vault(argv[2] if len(argv) > 2 else "")))
