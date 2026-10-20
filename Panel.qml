@@ -392,6 +392,7 @@ Panel {
               Math.max(heroLabels.implicitHeight, gearButton.implicitHeight))
 
             Text {
+              textFormat: Text.PlainText
               id: heroIcon
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
@@ -424,6 +425,7 @@ Panel {
               spacing: Style.space(2)
 
               Text {
+                textFormat: Text.PlainText
                 id: titleText
                 width: parent.width
                 text: "TaskNotes" + (root.currentView ? " · " + root.currentView.name : "")
@@ -447,6 +449,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 text: root.summary.toUpperCase()
                 color: Qt.darker(root.foreground, 1.4)
@@ -470,6 +473,7 @@ Panel {
             spacing: Style.space(6)
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               text: !root.vaultUnconfigured
                 ? "Vault — Enter to change it."
@@ -504,6 +508,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.vaultActive && root.noTaskNotes
               text: "TaskNotes isn't configured in this vault (no .obsidian/plugins/tasknotes/data.json)."
@@ -514,6 +519,7 @@ Panel {
             }
 
             Text {
+              textFormat: Text.PlainText
               width: parent.width
               visible: root.vaultActive && !root.noTaskNotes
               text: root.viewsLoaded
@@ -545,6 +551,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   id: viewRowLabel
                   anchors.left: parent.left
                   anchors.right: parent.right
@@ -598,6 +605,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: box
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
@@ -617,6 +625,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: rowLabel
                 anchors.left: box.right
                 anchors.leftMargin: Style.space(8)
@@ -644,6 +653,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: dueBadge
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
@@ -657,6 +667,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.viewReady && root.everScanned && root.rows.length === 0 && root.scanError === ""
             text: "Nothing in " + (root.currentView ? root.currentView.name : "this view")
@@ -667,6 +678,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             width: parent.width
             visible: root.scanError !== "" && root.viewReady
             text: root.scanError
