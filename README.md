@@ -37,14 +37,17 @@ omarchy plugin add https://github.com/Doghouse-Mike/omatasknotes.git --enable
 omarchy bar put doghouse-mike.omatasknotes --section center
 ```
 
-Requires `python3` and **`python-yaml`** (`pacman -S python-yaml`) --
-TaskNotes' views are real YAML (Obsidian's "Bases" format), and getting that
-parsing right needs an actual YAML parser rather than a hand-rolled one. If
-it's missing, the widget says so plainly rather than guessing.
+Nothing to install on a standard Omarchy system: it needs `python3` and
+`python-yaml`, and Omarchy already ships both (`python-yaml` comes in with
+`udiskie`). TaskNotes' views are real YAML (Obsidian's "Bases" format), and
+getting that parsing right needs an actual YAML parser rather than a
+hand-rolled one. If it's ever missing, the widget says so plainly rather
+than guessing.
 
-Ticking a **repeating** task also needs **`python-dateutil`**
-(`pacman -S python-dateutil`, usually already installed) to work out the next
-occurrence. Ticks are written exactly as TaskNotes writes them: a one-off task
+Ticking a **repeating** task works out the next occurrence from its repeat
+rule, covering everything TaskNotes' repeat editor produces; a rule using
+anything else (an hourly repeat, say) is refused with a message, not
+guessed at. Ticks are written exactly as TaskNotes writes them: a one-off task
 gets its completed status, `completedDate` and `dateModified`; a repeating
 task completes its current occurrence and moves on to the next one. Undo
 puts the note back exactly as it was.
