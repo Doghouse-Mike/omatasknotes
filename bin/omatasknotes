@@ -388,9 +388,12 @@ class _RRule:
             last = (date(d.year + d.month // 12, d.month % 12 + 1, 1) - timedelta(days=1)).day
             if not any(d.day == (n if n > 0 else last + 1 + n) for n in self.bymonthday):
                 return False
-        if self.byweekday or self.bynweekday:
-            if d.weekday() not in self.byweekday and not (self.bynweekday and self._nth_ok(d, days)):
-                return False
+        # Plain and numbered weekdays are separate filters that must both
+        # pass (so mixing them narrows, not widens) -- dateutil and rrule.js.
+        if self.byweekday and d.weekday() not in self.byweekday:
+            return False
+        if self.bynweekday and not self._nth_ok(d, days):
+            return False
         return True
 
     def _iter(self, stop):
