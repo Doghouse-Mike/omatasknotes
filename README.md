@@ -118,16 +118,9 @@ much smaller, unambiguous format.
 
 ## Sync
 
-Nothing here touches a network by default. The widget reads and writes
+Nothing here touches a network. The widget only reads and writes
 frontmatter in a folder; keeping that folder current is someone else's job
 (Obsidian Sync, Syncthing, git, whatever you already use).
-
-If TaskNotes' own local HTTP API happens to be enabled (Settings ->
-TaskNotes -> Integrations -> HTTP API) and Obsidian is running, ticking a
-task also nudges the API after writing the file -- a best-effort extra,
-never required, and never the source of truth. The file write always happens
-first and is what actually decides the result; the API is silently skipped
-if Obsidian isn't open or doesn't answer within about a second and a half.
 
 Because sync can rewrite a file at any moment, every write is a compare-and
 -swap on a hash of the frontmatter block: if that block changed since the

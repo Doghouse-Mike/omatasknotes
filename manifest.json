@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "doghouse-mike.omatasknotes",
   "name": "OmaTaskNotes",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "author": "Doghouse-Mike",
   "license": "MIT",
   "description": "Obsidian TaskNotes tasks from a local vault, in the Omarchy bar",

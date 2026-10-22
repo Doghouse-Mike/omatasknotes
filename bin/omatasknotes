@@ -25,9 +25,6 @@ import signal
 import stat
 import sys
 import tempfile
-import urllib.request
-import urllib.error
-import urllib.parse
 from datetime import date, datetime, timedelta
 
 try:
@@ -40,7 +37,6 @@ except ImportError:
 MAX_SCAN_FILES = 2000        # bound: a runaway/misconfigured vaultPath can't hang the widget
 MAX_ROWS = 300               # bound: popup renders at most this many rows
 MAX_COMPLETE_INSTANCES = 500 # bound: cap a recurring task's completion history
-API_TIMEOUT = 1.5            # seconds -- a hung Obsidian must never hang the widget
 # The vault may be shared or synced, so everything read from it is treated as
 # untrusted: each file, string and the total output handed to the shell is
 # bounded, and the whole run has a deadline.
@@ -1165,48 +1161,6 @@ def cmd_views(vault_path):
     ]}))
 
 
-# ------------------------------------------------------------- API bonus ---
-
-def api_base(settings):
-    if not settings.get("enableAPI"):
-        return None
-    # data.json syncs with the vault, so the port is checked rather than
-    # trusted: the auth token goes to it.
-    port = settings.get("apiPort", 8080)
-    if isinstance(port, bool) or not isinstance(port, (int, str)):
-        return None
-    try:
-        port = int(port)
-    except ValueError:
-        return None
-    if not 1 <= port <= 65535:
-        return None
-    return "http://127.0.0.1:%d" % port
-
-
-def api_request(settings, method, path, payload=None):
-    base = api_base(settings)
-    if base is None:
-        return None
-    url = base + path
-    data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Content-Type", "application/json")
-    token = settings.get("apiAuthToken") or ""
-    if token:
-        req.add_header("Authorization", "Bearer " + token)
-    try:
-        with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
-            body = resp.read(1 << 20)  # bound: never read an unbounded response
-            return json.loads(body.decode("utf-8"))
-    except Exception:
-        return None  # any failure -> caller falls back to direct file write
-
-
-def api_health_ok(settings):
-    return api_request(settings, "GET", "/api/health") is not None
-
-
 # ------------------------------------------------------------ mutations ----
 
 def cmd_complete(vault_path, rel_path, expected_hash):
@@ -1252,9 +1206,6 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
     recurring = truthy(fm.get("recurrence"))
     blocks = field_blocks(fm_lines)
     prev_status = fm.get("status")
-
-    api_ok = api_health_ok(settings)
-    api_payload = {}
 
     # Mirrors what TaskNotes itself writes (see OmaForge docs/tasknotes-spec.md):
     # every write bumps dateModified; completing a non-repeating task stamps
@@ -1333,7 +1284,6 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
             if not is_completed_status(settings, new_status):
                 blocks = remove_field(blocks, "completedDate")
         blocks = set_field(blocks, "status", new_status)
-        api_payload = {"status": new_status}
     blocks = set_field(blocks, "dateModified", now_ts())
 
     new_fm_text = blocks_to_text(blocks)
@@ -1344,17 +1294,6 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
     except OSError as e:
         print(json.dumps({"ok": False, "error": "write-failed", "message": str(e)}))
         return
-
-    if api_ok and api_payload:
-        # Best-effort only: the file write above is already the source of
-        # truth and has already succeeded: this just gives Obsidian's own
-        # running instance a nudge via its own logic (e.g. auto-archive on
-        # complete). A failure here is silently ignored.
-        try:
-            api_request(settings, "PUT", "/api/tasks/" + urllib.parse.quote(rel_path, safe=""),
-                        api_payload)
-        except Exception:
-            pass
 
     final_text = read_text(full)
     final_split = split_frontmatter(final_text)
