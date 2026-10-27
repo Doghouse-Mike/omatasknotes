@@ -151,8 +151,7 @@ Panel {
     if (!task || editProc.running) return
     editProc.mode = "complete"
     editProc.subject = task
-    editProc.command = [root.helper, "complete", root.vaultPath, task.file, task.hash]
-    editProc.running = true
+    root.runEdit("complete", { file: task.file, hash: task.hash })
   }
 
   function openInObsidian(task) {
@@ -172,9 +171,10 @@ Panel {
     root.justDone = root.justDone.filter(function (e) { return e.file !== entry.file })
     editProc.mode = "uncomplete"
     editProc.subject = null
-    editProc.command = [root.helper, "uncomplete", root.vaultPath, entry.file, entry.newHash,
-      entry.restoreMode || "", String(entry.restoreValue === undefined ? "" : entry.restoreValue)]
-    editProc.running = true
+    root.runEdit("uncomplete", {
+      file: entry.file, hash: entry.newHash, restoreMode: entry.restoreMode || "",
+      restoreValue: String(entry.restoreValue === undefined ? "" : entry.restoreValue)
+    })
   }
 
   function markJustDone(task, newHash, restoreMode, restoreValue) {
@@ -192,7 +192,15 @@ Panel {
     if (!root.vaultActive || editProc.running || String(text).trim() === "") return
     editProc.mode = "add"
     editProc.subject = null
-    editProc.command = [root.helper, "create", root.vaultPath, String(text).trim()]
+    root.runEdit("create", { title: String(text).trim() })
+  }
+
+  // Task data goes to the helper on stdin, never argv: another local account
+  // can read a process's command line from /proc, even when the vault is
+  // owner-only.
+  function runEdit(cmd, request) {
+    editProc.request = JSON.stringify(request)
+    editProc.command = [root.helper, cmd, root.vaultPath]
     editProc.running = true
   }
 
@@ -296,6 +304,12 @@ Panel {
     id: editProc
     property string mode: ""
     property var subject: null
+    property string request: ""
+    stdinEnabled: true
+    onStarted: {
+      write(request + "\n")
+      request = ""
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

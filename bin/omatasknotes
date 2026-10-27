@@ -49,6 +49,7 @@ MAX_TITLE = 300              # bound: characters of a title shown in a row
 MAX_LABEL = 100              # bound: characters of any other displayed string
 MAX_OUTPUT = 2 * 1024 * 1024 # bound: bytes of JSON the shell has to buffer and parse
 DEADLINE_SEC = 20            # bound: wall-clock time for one helper run
+MAX_REQUEST = 64 * 1024      # bound: bytes of the edit request read from stdin
 
 FORBIDDEN_TOKENS = ("file(", "list(", ".filter(", ".map(", ".reduce(",
                     "timeEntries", "&&", "||", "reminders", "googleCalendar")
@@ -1374,6 +1375,22 @@ def main(argv):
         sys.stdout.write(out)
 
 
+def read_request():
+    """The edit commands take their task data as one JSON line on stdin.
+
+    Never argv: another local account can read /proc/<pid>/cmdline, which
+    would expose task titles and file names even in an owner-only vault.
+    A missing line is bounded by the run's deadline.
+    """
+    raw = sys.stdin.buffer.readline(MAX_REQUEST + 1)
+    if len(raw) > MAX_REQUEST:
+        raise ValueError("request too large")
+    req = json.loads(raw.decode("utf-8"))
+    if not isinstance(req, dict):
+        raise ValueError("request is not an object")
+    return {k: str(v) for k, v in req.items() if isinstance(v, (str, int))}
+
+
 def _deadline(signum, frame):
     raise TimeoutError("took longer than %ds" % DEADLINE_SEC)
 
@@ -1388,14 +1405,19 @@ def _run(cmd, argv):
             cmd_views(expand(argv[2]))
         elif cmd == "scan":
             cmd_scan(expand(argv[2]), argv[3])
-        elif cmd == "complete":
-            cmd_complete(expand(argv[2]), argv[3], argv[4])
-        elif cmd == "uncomplete":
-            mode = argv[5] if len(argv) > 5 else ""
-            value = argv[6] if len(argv) > 6 else ""
-            cmd_uncomplete(expand(argv[2]), argv[3], argv[4], mode, value)
-        elif cmd == "create":
-            cmd_create(expand(argv[2]), argv[3])
+        elif cmd in ("complete", "uncomplete", "create"):
+            try:
+                req = read_request()
+            except (ValueError, UnicodeDecodeError):
+                print(json.dumps({"ok": False, "error": "bad-request"}))
+                return 0
+            if cmd == "complete":
+                cmd_complete(expand(argv[2]), req.get("file", ""), req.get("hash", ""))
+            elif cmd == "uncomplete":
+                cmd_uncomplete(expand(argv[2]), req.get("file", ""), req.get("hash", ""),
+                               req.get("restoreMode", ""), req.get("restoreValue", ""))
+            else:
+                cmd_create(expand(argv[2]), req.get("title", ""))
         else:
             eprint("unknown command: %s" % cmd)
             return 2

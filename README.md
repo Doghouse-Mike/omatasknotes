@@ -172,7 +172,9 @@ A vault may be shared or synced, so its contents are treated as untrusted.
 Text from it is always shown as plain text, never rich text. Notes over
 256 KB, symlinks, non-regular files and YAML using aliases are skipped.
 Titles are cut at 300 characters, the view picker shows at most 200 views,
-and each run of the helper is stopped after 20 seconds.
+and each run of the helper is stopped after 20 seconds. Task titles and
+file names reach the helper on stdin, never as command-line arguments, so
+other accounts on the machine can't read them from the process list.
 
 
 ## If you find this useful, and can spare the cash:
