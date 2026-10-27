@@ -1203,6 +1203,17 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
         print(json.dumps({"ok": False, "error": "stale",
                            "message": "task changed on disk since it was scanned"}))
         return
+    # Properties that aren't valid YAML (e.g. an unquoted ": " in a title)
+    # parse to nothing, so the old status would be lost and undo couldn't
+    # restore it. Obsidian flags these notes too; refuse rather than guess.
+    try:
+        parsed = load_yaml("\n".join(fm_lines))
+    except yaml.YAMLError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        print(json.dumps({"ok": False, "error": "bad-frontmatter",
+                           "message": "this note's properties aren't valid YAML; fix them in Obsidian first"}))
+        return
     fm = parse_frontmatter(fm_lines)
     recurring = truthy(fm.get("recurrence"))
     blocks = field_blocks(fm_lines)
