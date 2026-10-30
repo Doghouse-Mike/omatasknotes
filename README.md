@@ -15,6 +15,8 @@ widget.
 
 <img src="preview.png" alt="The popup listing a TaskNotes view's open tasks" width="380">
 
+If you dig this, you may also enjoy [OmaForge](https://github.com/Doghouse-Mike/omaforge).
+
 ## How it's meant to be used
 
 The vault is the only state -- no database, no account, no cache beyond one
