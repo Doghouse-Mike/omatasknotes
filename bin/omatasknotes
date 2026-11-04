@@ -473,6 +473,23 @@ def _occurrences(r, start_day, end_day):
     return [o.date() for o in r.between(lo, hi, inc=True)]
 
 
+RECURRING_KEYS = ("scheduled", "due", "complete_instances", "skipped_instances", "recurrence",
+                  "recurrence_original_date")
+
+
+def move_original(fm):
+    """TaskNotes 4.15+ `recurrence_original_date`: which occurrence a moved
+    `scheduled` really is. None unless it's a valid YYYY-MM-DD."""
+    v = date_str(fm.get("recurrence_original_date")).strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+        return None
+    try:
+        date.fromisoformat(v)
+    except ValueError:
+        return None
+    return v
+
+
 def recurring_instance(rule, target, completed, skipped, anchor, fallback_start):
     """Which occurrence a tick on `target` completes (TaskNotes §4.4)."""
     t = date.fromisoformat(target)
@@ -1230,7 +1247,7 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
         except Unsupported as e:
             print(json.dumps({"ok": False, "error": "unsupported-recurrence", "message": str(e)}))
             return
-        before = {k: fm.get(k) for k in ("scheduled", "due", "complete_instances", "skipped_instances", "recurrence")}
+        before = {k: fm.get(k) for k in RECURRING_KEYS}
         if make_done:
             completed = [date_str(x)[:10] for x in (fm.get("complete_instances") or [])]
             skipped = [date_str(x)[:10] for x in (fm.get("skipped_instances") or [])]
@@ -1239,8 +1256,11 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
             anchor = "completion" if str(fm.get("recurrence_anchor") or "") == "completion" else "scheduled"
             fallback = parse_date(scheduled) or parse_date(fm.get("dateCreated"))
             rule = str(fm.get("recurrence"))
-            target = today if anchor == "completion" else (scheduled[:10] or due[:10] or today)
+            # TaskNotes 4.15+: a moved occurrence keeps its identity here.
+            pending = move_original(fm) if anchor == "scheduled" else None
+            target = today if anchor == "completion" else (pending or scheduled[:10] or due[:10] or today)
             inst = recurring_instance(rule, target, completed, skipped, anchor, fallback)
+            reopening = bool(pending) and (inst in completed or inst != pending)
             if inst in completed:
                 completed.remove(inst)   # TaskNotes toggles an already-done occurrence
             else:
@@ -1255,9 +1275,11 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
             blocks = set_field(blocks, "complete_instances", completed)
             blocks = set_field(blocks, "skipped_instances", skipped)
             suffix = scheduled[10:] if len(scheduled) > 10 else ""
-            work_sched = scheduled if anchor == "completion" else inst + suffix
-            nxt = next_open_occurrence(rule, max(today, inst), completed, skipped, anchor, fallback)
+            # A known move keeps its own scheduled/due span for the due offset.
+            work_sched = scheduled if anchor == "completion" or pending else inst + suffix
+            nxt = None if reopening else next_open_occurrence(rule, max(today, inst), completed, skipped, anchor, fallback)
             if nxt:
+                blocks = remove_field(blocks, "recurrence_original_date")
                 blocks = set_field(blocks, "scheduled", nxt + suffix)
                 if due and work_sched and due[:10] < nxt:
                     try:
@@ -1279,7 +1301,7 @@ def _mutate(vault_path, rel_path, expected_hash, make_done, restore_mode=None, r
             if not isinstance(prev, dict):
                 print(json.dumps({"ok": False, "error": "no-undo", "message": "nothing to restore"}))
                 return
-            for k in ("scheduled", "due", "complete_instances", "skipped_instances", "recurrence"):
+            for k in RECURRING_KEYS:
                 if k not in prev:
                     continue
                 v = prev.get(k)
